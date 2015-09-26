@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"sort"
@@ -11,17 +12,29 @@ import (
 	"github.com/UniversityRadioYork/baps3-go"
 )
 
-// GetResponse is the outer structure of all GET responses.
-type GetResponse struct {
+// Response is the outer structure of all json responses.
+type Response struct {
 	Status string
-	Value  interface{}
+	Value  interface{} `json:",omitempty"`
 }
 
-// GetOk creates a GetResponse wrapping a successful GET result.
-func GetOk(value interface{}) *GetResponse {
-	r := new(GetResponse)
+// GetOk creates a Response wrapping a successful GET result.
+func GetOk(value interface{}) *Response {
+	r := new(Response)
 	r.Status = "ok"
 	r.Value = value
+	return r
+}
+
+// PutRequest is the structure of all incoming json PUT payloads
+type PutRequest struct {
+	Value interface{}
+}
+
+// PutOk creates a Response wrapping a successful PUT
+func PutOk() *Response {
+	r := new(Response)
+	r.Status = "ok"
 	return r
 }
 
@@ -74,8 +87,14 @@ func (c *bfConnector) Run() {
 			resource := strings.Replace(rq.resource, "/"+c.name, "", 1)
 			fmt.Printf("connector %s response %s\n", c.name, resource)
 
-			// TODO(CaptainHayashi): other methods
-			rq.resCh <- c.get(resource)
+			// TODO(wlcx): A default and appropriate error for other methods
+			// atm this results in stalled http request
+			switch rq.method {
+			case "GET":
+				rq.resCh <- c.get(resource)
+			case "PUT":
+				rq.resCh <- c.put(resource, rq.payload)
+			}
 		case res := <-c.resCh:
 			if err := c.state.Update(res); err != nil {
 				fmt.Println(err)
@@ -107,7 +126,7 @@ func (c *bfConnector) get(resource string) interface{} {
 
 	if r == nil {
 		// TODO(CaptainHayashi): more errors
-		return GetResponse{
+		return Response{
 			Status: "what",
 			Value:  "resource not found: " + resource,
 		}
@@ -116,31 +135,53 @@ func (c *bfConnector) get(resource string) interface{} {
 	return GetOk(r)
 }
 
+func (c *bfConnector) put(resource string, payload []byte) interface{} {
+	resourcePath := splitResource(resource)
+	r := c.rootPut(resourcePath, payload)
+
+	if r == nil {
+		return Response{
+			Status: "what",
+			Value:  "resource not found: " + resource,
+		}
+	}
+
+	return PutOk()
+}
+
 /* These resMaps describe simple composite resources, mapping each child
  * resource to the functions handling them.
  *
- * TODO(CaptainHayashi): add support for things that aren't GET
- *   (have each resource be a jump table of possible methods, or send the method
- *    to the resMap func?)
  * TODO(CaptainHayashi): decouple traversal from GET
  * TODO(CaptainHayashi): maybe make traversal iterative instead of recursive?
  */
 
-type resMap map[string]func(*bfConnector, []string) interface{}
+type resHandler struct {
+	get func(*bfConnector, []string) interface{}
+	put func(*bfConnector, []string, []byte) interface{}
+}
+
+type resMap map[string]resHandler
 
 var (
 	rootRes = resMap{
-		"control": (*bfConnector).controlGet,
-		"player":  (*bfConnector).playerGet,
-		// "playlist": (*bfConnector).playlistGet
+		"control": resHandler{
+			(*bfConnector).controlGet,
+			(*bfConnector).controlPut,
+		},
+		"player": resHandler{(*bfConnector).playerGet, nil},
+		// "playlist": resHandler{(*bfConnector).playlistGet, nil},
 	}
 	controlRes = resMap{
-		"features": (*bfConnector).featuresGet,
-		"state":    (*bfConnector).stateGet,
+		"features": resHandler{(*bfConnector).featuresGet, nil},
+		"state": resHandler{
+			(*bfConnector).stateGet,
+			(*bfConnector).statePut,
+		},
 	}
 	playerRes = resMap{
-		"time": (*bfConnector).timeGet,
-		"file": (*bfConnector).fileGet,
+		"time": resHandler{(*bfConnector).timeGet, nil},
+		"file": resHandler{(*bfConnector).fileGet, nil},
 	}
 )
 
@@ -151,7 +192,7 @@ func (c *bfConnector) getResource(rm resMap, resourcePath []string) interface{} 
 		object := make(map[string]interface{})
 
 		for k := range rm {
-			child := rm[k](c, []string{})
+			child := rm[k].get(c, []string{})
 
 			// Only add a key if the child definitely exists.
 			if child != nil {
@@ -163,18 +204,48 @@ func (c *bfConnector) getResource(rm resMap, resourcePath []string) interface{} 
 	}
 
 	// Does the next step on the resource path exist?
-	rfunc, ok := rm[resourcePath[0]]
+	rhandler, ok := rm[resourcePath[0]]
 	if ok {
 		// Make it that resource's responsibility to
 		// find the resource, then.
-		return rfunc(c, resourcePath[1:])
+		return rhandler.get(c, resourcePath[1:])
 	}
 	return nil
+}
+
+func (c *bfConnector) putResource(rm resMap, resourcePath []string, payload []byte) interface{} {
+	if len(resourcePath) == 0 {
+		return nil
+	}
+
+	// Does the next step on the resource path exist?
+	rhandler, ok := rm[resourcePath[0]]
+	if ok {
+		// Make it that resource's responsibility to
+		// find the resource, then.
+		return rhandler.put(c, resourcePath[1:], payload)
+	}
+	return nil
+}
+
+// rootGet is the GET handler for the / resource.
+func (c *bfConnector) rootGet(resourcePath []string) interface{} {
+	return c.getResource(rootRes, resourcePath)
+}
+
+// rootPut is the PUT handler for the / resource.
+func (c *bfConnector) rootPut(resourcePath []string, payload []byte) interface{} {
+	return c.putResource(rootRes, resourcePath, payload)
 }
 
 // controlGet is the GET handler for the /control resource.
 func (c *bfConnector) controlGet(resourcePath []string) interface{} {
 	return c.getResource(controlRes, resourcePath)
+}
+
+// controlPut is the PUT handler for the /control resource.
+func (c *bfConnector) controlPut(resourcePath []string, payload []byte) interface{} {
+	return c.putResource(controlRes, resourcePath, payload)
 }
 
 // playerGet is the GET handler for the /player resource.
@@ -189,10 +260,6 @@ func (c *bfConnector) playerGet(resourcePath []string) interface{} {
 	return c.getResource(playerRes, resourcePath)
 }
 
-// rootGet is the GET handler for the / resource.
-func (c *bfConnector) rootGet(resourcePath []string) interface{} {
-	return c.getResource(rootRes, resourcePath)
-}
 
 // GET value for /control/features
 func (c *bfConnector) featuresGet(resourcePath []string) interface{} {
@@ -236,6 +303,32 @@ func (c *bfConnector) stateGet(resourcePath []string) interface{} {
 	}
 
 	return c.state.State
+}
+
+var stateMap = map[string]baps3.MessageWord{
+	"play": baps3.RqPlay,
+	"stop": baps3.RqStop,
+}
+
+// PUT function for /control/state
+func (c *bfConnector) statePut(resourcePath []string, payload []byte) interface{} {
+	if 0 < len(resourcePath) {
+		return nil
+	}
+
+	var jsonReq PutRequest
+	if err := json.Unmarshal(payload, &jsonReq); err != nil {
+		// Do something, Gromit!
+	}
+	newstate, ok := jsonReq.Value.(string)
+	if ok {
+		rqWord, ok := stateMap[newstate]
+		if ok {
+			c.conn.ReqCh <- *baps3.NewMessage(rqWord)
+		}
+	}
+
+	return c.state
 }
 
 // GET value for /player/time

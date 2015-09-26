@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,8 +12,9 @@ import (
 )
 
 type httpRequest struct {
-	// TODO(CaptainHayashi): method, payload
 	resource string
+	method   string
+	payload  []byte
 	resCh    chan<- interface{}
 }
 
@@ -50,9 +52,15 @@ func installConnector(router *mux.Router, connector *bfConnector) {
 
 		resource := r.URL.Path
 
+		buf := new(bytes.Buffer)
+		buf.ReadFrom(r.Body)
+		payload := buf.Bytes()
+
 		w.Header().Add("Content-Type", "application/json")
 		connector.reqCh <- httpRequest{
 			resource,
+			r.Method,
+			payload,
 			resCh,
 		}
 
